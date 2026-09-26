@@ -20,7 +20,9 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.openarm_policy as openarm_policy
 import openpi.shared.download as _download
+import openpi.shared.nnx_utils as _nnx_utils
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
@@ -459,6 +461,69 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotOpenArmDataConfig(DataConfigFactory):
+    """Data config for a bimanual OpenArm dataset recorded in LeRobot format.
+
+    The dataset has a 16-dimensional state and action (`[left_joint_1..7, left_gripper,
+    right_joint_1..7, right_gripper]`) and three cameras: `cam_chest`, `left_cam_wrist` and
+    `right_cam_wrist`.
+
+    Actions are absolute joint position commands, so delta actions are off by default. Set
+    `use_delta_joint_actions=True` to train on joint deltas relative to the current state instead
+    (gripper dimensions stay absolute).
+    """
+
+    use_delta_joint_actions: bool = False
+    # If provided, will be injected into the input data if the "prompt" key is not present.
+    default_prompt: str | None = None
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_chest": "observation.images.cam_chest",
+                            "left_cam_wrist": "observation.images.left_cam_wrist",
+                            "right_cam_wrist": "observation.images.right_cam_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        # `RepackTransform` keeps only the keys listed here, and `prompt_from_task` adds
+                        # the prompt before this transform runs, so it has to be carried through.
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+    )
+    # Action keys that will be used to read the action sequence from the dataset.
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[openarm_policy.OpenArmInputs()],
+            outputs=[openarm_policy.OpenArmOutputs()],
+        )
+        if self.use_delta_joint_actions:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(openarm_policy.DELTA_MASK)],
+                outputs=[_transforms.AbsoluteActions(openarm_policy.DELTA_MASK)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -915,6 +980,61 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    #
+    # Bimanual OpenArm configs. These fine-tune pi0.5 on a locally recorded bimanual dataset
+    # (two 7-DoF arms, 16-dim joint state/action, three cameras).
+    #
+    TrainConfig(
+        name="pi05_openarm",
+        # pi0.5 is pretrained with 32-dim actions, so the 16-dim OpenArm actions get zero-padded up
+        # to 32 by the `PadStatesAndActions` model transform. `action_horizon` is the number of future
+        # actions predicted per forward pass; at 30 fps, 10 is a third of a second of motion.
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=10,
+            # Train the LoRA adapters only. The variants have to match `freeze_filter` below,
+            # otherwise the adapters do not exist and nothing is frozen.
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotOpenArmDataConfig(
+            # Path to the LeRobot-format dataset. It can either be a local path or a HuggingFace
+            # repo id. See examples/openarm/convert_v3_to_lerobot_v21.py for how a LeRobot v3.0
+            # dataset is converted to the v2.1 layout that openpi's LeRobot version reads.
+            repo_id="/home/fbot/openarm_bimanual_vr_v21",
+            # `repo_id` is an absolute path, so name the asset explicitly to keep the norm stats at
+            # `assets/pi05_openarm/openarm/norm_stats.json` instead of inside the dataset directory.
+            assets=AssetsConfig(asset_id="openarm"),
+            base_config=DataConfig(
+                # Read the language instruction from the dataset's `task` field.
+                prompt_from_task=True,
+            ),
+        ),
+        # JAX-format base weights. The released checkpoint is ~13 GB of float32, which does not fit in
+        # host memory next to the optimizer state, so it is loaded straight onto the accelerator and
+        # converted to bfloat16 during the read.
+        weight_loader=weight_loaders.DeviceCheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # `scripts/train_pytorch.py` cannot be used for this config: its model class has no LoRA
+        # support and it sends every parameter to the optimizer, ignoring `freeze_filter` below.
+        pytorch_weight_path=None,
+        # Freeze everything except the LoRA adapters, which is what makes fine-tuning fit on a
+        # single consumer GPU. The adapters do not exist unless the model variants above are the
+        # `_lora` ones. Note that the default filter from `Pi0Config.get_freeze_filter()` also trains
+        # the ~420M-parameter vision encoder, which does not fit next to the base weights in 12 GB.
+        freeze_filter=nnx.Not(_nnx_utils.PathRegex(".*lora.*")),
+        ema_decay=None,
+        # The 6.9 GB of bfloat16 base weights leave ~5 GB for activations, so the batch has to stay
+        # small. 12,393 frames at batch 2 is ~6,200 steps per epoch.
+        num_train_steps=8_000,
+        batch_size=2,
+        # One worker keeps peak host memory reasonable next to the base checkpoint read.
+        num_workers=1,
+        log_interval=20,
+        save_interval=1_000,
+        keep_period=2_000,
+        wandb_enabled=False,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

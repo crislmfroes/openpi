@@ -6,6 +6,7 @@ from typing import Any
 
 import etils.epath as epath
 import flax.nnx as nnx
+from flax.nnx import traversals
 from flax.training import common_utils
 import flax.traverse_util as traverse_util
 import jax
@@ -16,6 +17,7 @@ import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
+import openpi.models.lora as _lora
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
@@ -73,12 +75,79 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
     """Loads and validates the weights. Returns a loaded subset of the weights."""
     loaded_params = loader.load(params_shape)
-    at.check_pytree_equality(expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=True)
+    # A loader that declares `converts_dtype` casts the checkpoint to another dtype, so its dtypes
+    # intentionally differ from the float32 shapes the model was traced with. Only shapes compare.
+    converts_dtype = getattr(loader, "converts_dtype", False)
+    at.check_pytree_equality(
+        expected=params_shape, got=loaded_params, check_shapes=True, check_dtypes=not converts_dtype
+    )
 
     # Remove jax.ShapeDtypeStruct from the loaded params. This makes sure that only the loaded params are returned.
     return traverse_util.unflatten_dict(
         {k: v for k, v in traverse_util.flatten_dict(loaded_params).items() if not isinstance(v, jax.ShapeDtypeStruct)}
     )
+
+
+def _norm_keypath(keypath: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Normalizes a state keypath so that keys from a checkpoint and from the model state compare equal.
+
+    Sequence indices are integers in `nnx` keypaths but strings in the nested dicts read from a checkpoint.
+    """
+    normalized = []
+    for key in keypath:
+        try:
+            normalized.append(int(key))
+        except (TypeError, ValueError):
+            normalized.append(key)
+    return tuple(normalized)
+
+
+def _create_params(config: _config.TrainConfig, params_shape: nnx.State, rng: at.KeyArrayLike) -> nnx.State:
+    """Materializes the initial parameters in the dtype they will be trained in.
+
+    pi0/pi0.5 models have ~3.4B parameters. Creating them with `config.model.create()` materializes all of
+    them in float32 (~13 GB) on the accelerator before any optimizer state exists, which does not fit on
+    smaller cards.
+
+    The base parameters come from the weight loader, which is expected to have already placed them on the
+    accelerator in bfloat16 (`DeviceCheckpointWeightLoader`), and only the trainable LoRA parameters are
+    initialized here, in float32. A loader that returns host arrays instead is still supported: those are
+    converted one at a time, so the float32 copy of the whole checkpoint is never resident at once.
+    """
+    loaded = {
+        _norm_keypath(keypath): value
+        for keypath, value in traversals.flatten_mapping(
+            _load_weights_and_validate(config.weight_loader, params_shape.to_pure_dict())
+        ).items()
+    }
+    keys = jax.random.split(rng, len(params_shape.flat_state()))
+
+    converted = {}
+    for (keypath, var), key in zip(params_shape.flat_state().items(), keys, strict=True):
+        frozen = config.freeze_filter(keypath, var.value)
+        if (norm_keypath := _norm_keypath(keypath)) in loaded:
+            value = loaded.pop(norm_keypath)
+            if isinstance(value, jax.Array):
+                # `DeviceCheckpointWeightLoader` already placed this on the accelerator in its target dtype,
+                # so copying it back to the host would only undo that.
+                converted[keypath] = value
+            else:
+                converted[keypath] = np.asarray(value).astype(jnp.bfloat16 if frozen else jnp.float32, copy=False)
+        elif frozen:
+            raise ValueError(
+                f"Frozen parameter {jax.tree_util.keystr(keypath)} is missing from the checkpoint loaded by "
+                f"{config.weight_loader}. It cannot be initialized randomly because it is not trained."
+            )
+        else:
+            # Parameters the checkpoint does not provide are the ones trained from scratch, i.e. the LoRA
+            # adapters. They use the default initializer of `lora.LoRAConfig`.
+            converted[keypath] = np.asarray(
+                _lora.LoRAConfig(rank=1).init_fn(key, var.value.shape, jnp.float32), dtype=np.float32
+            )
+
+    params = params_shape
+    params.replace_by_pure_dict(traversals.unflatten_mapping(converted))
+    return params
 
 
 @at.typecheck
@@ -87,48 +156,34 @@ def init_train_state(
 ) -> tuple[training_utils.TrainState, Any]:
     tx = _optimizer.create_optimizer(config.optimizer, config.lr_schedule, weight_decay_mask=None)
 
-    def init(rng: at.KeyArrayLike, partial_params: at.Params | None = None) -> training_utils.TrainState:
-        rng, model_rng = jax.random.split(rng)
-        # initialize the model (and its parameters).
-        model = config.model.create(model_rng)
+    # Trace the model to obtain its structure and parameter shapes without allocating any values.
+    # See `_create_params` for why the model is not created on the accelerator.
+    _, model_rng = jax.random.split(init_rng)
+    model_def, params_shape = nnx.split(nnx.eval_shape(config.model.create, model_rng))
 
-        # Merge the partial params into the model.
-        if partial_params is not None:
-            graphdef, state = nnx.split(model)
-            # This will produce an error if the partial params are not a subset of the state.
-            state.replace_by_pure_dict(partial_params)
-            model = nnx.merge(graphdef, state)
-
-        params = nnx.state(model)
-        # Convert frozen params to bfloat16.
-        params = nnx_utils.state_map(params, config.freeze_filter, lambda p: p.replace(p.value.astype(jnp.bfloat16)))
-
+    def init(params: nnx.State) -> training_utils.TrainState:
         return training_utils.TrainState(
             step=0,
             params=params,
-            model_def=nnx.graphdef(model),
+            model_def=model_def,
             tx=tx,
             opt_state=tx.init(params.filter(config.trainable_filter)),
             ema_decay=config.ema_decay,
             ema_params=None if config.ema_decay is None else params,
         )
 
-    train_state_shape = jax.eval_shape(init, init_rng)
+    train_state_shape = jax.eval_shape(init, params_shape)
     state_sharding = sharding.fsdp_sharding(train_state_shape, mesh, log=True)
 
     if resume:
         return train_state_shape, state_sharding
 
-    partial_params = _load_weights_and_validate(config.weight_loader, train_state_shape.params.to_pure_dict())
+    _, params_rng = jax.random.split(init_rng)
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-
-    # Initialize the train state and mix in the partial params.
-    train_state = jax.jit(
-        init,
-        donate_argnums=(1,),  # donate the partial params buffer.
-        in_shardings=replicated_sharding,
-        out_shardings=state_sharding,
-    )(init_rng, partial_params)
+    # Build the parameters, then place them and the optimizer state on the mesh. This is done eagerly
+    # instead of under `jax.jit` so that the weights are not buffered twice on the accelerator.
+    params = jax.device_put(_create_params(config, params_shape, params_rng), replicated_sharding)
+    train_state = jax.device_put(init(params), state_sharding)
 
     return train_state, state_sharding
 
@@ -217,11 +272,22 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
+    # Initialize the train state before the data loader starts iterating, so that restoring the base
+    # checkpoint does not have to share host memory with the loader's worker processes and prefetch
+    # buffers. The data loader itself is only stepped after the state is fully restored.
+    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
+    jax.block_until_ready(train_state.params)
+    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
         shuffle=True,
     )
+
+    if resuming:
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+
     data_iter = iter(data_loader)
     batch = next(data_iter)
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
@@ -232,13 +298,6 @@ def main(config: _config.TrainConfig):
         for i in range(min(5, len(next(iter(batch[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
-
-    train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
-    jax.block_until_ready(train_state)
-    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
-
-    if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
