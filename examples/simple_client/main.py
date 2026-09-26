@@ -21,6 +21,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    OPENARM = "openarm"
 
 
 @dataclasses.dataclass
@@ -120,6 +121,7 @@ def main(args: Args) -> None:
         EnvMode.ALOHA_SIM: _random_observation_aloha,
         EnvMode.DROID: _random_observation_droid,
         EnvMode.LIBERO: _random_observation_libero,
+        EnvMode.OPENARM: _random_observation_openarm,
     }[args.env]
 
     policy = _websocket_client_policy.WebsocketClientPolicy(
@@ -179,6 +181,20 @@ def _random_observation_libero() -> dict:
         "observation/image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "do something",
+    }
+
+
+def _random_observation_openarm() -> dict:
+    # Two 7-DoF arms with a gripper each: 16-dim state. The images are keyed by the bare camera names the
+    # dataset uses, which is what `openarm_policy.OpenArmInputs` expects.
+    return {
+        "state": np.zeros((16,), dtype=np.float32),
+        "images": {
+            "cam_chest": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+            "left_cam_wrist": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+            "right_cam_wrist": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        },
+        "prompt": "put the lego brick in the box",
     }
 
 
